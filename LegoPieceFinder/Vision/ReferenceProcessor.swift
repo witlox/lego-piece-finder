@@ -50,17 +50,25 @@ enum ReferenceProcessor {
         // Downsample to limit memory — 2000px is plenty for callout box analysis.
         let cgImage = ContourDetector.downsample(rawCGImage, maxDimension: 2000)
 
+        // Detect all text regions so we can exclude contours that are just
+        // text (step numbers, labels, etc.) rather than piece illustrations.
+        let textRegions = findAllTextRegions(in: cgImage)
+
         // Strategy 1: Text-guided extraction using quantity markers
         let markers = findQuantityMarkers(in: cgImage)
         if !markers.isEmpty {
-            let descriptors = extractPiecesUsingMarkers(markers, in: cgImage)
+            let descriptors = extractPiecesUsingMarkers(
+                markers, in: cgImage, textRegions: textRegions
+            )
             if !descriptors.isEmpty {
                 return descriptors
             }
         }
 
         // Strategy 2: Contour-only fallback
-        let descriptors = try extractPiecesFromContours(in: cgImage)
+        let descriptors = try extractPiecesFromContours(
+            in: cgImage, textRegions: textRegions
+        )
 
         guard !descriptors.isEmpty else {
             throw ProcessingError.noContoursFound
@@ -76,6 +84,44 @@ enum ReferenceProcessor {
             throw ProcessingError.noContoursFound
         }
         return first
+    }
+
+    // MARK: - Text detection
+
+    /// Detects all text bounding boxes in the image.
+    /// Used to filter out contours that are text (step numbers, labels)
+    /// rather than piece illustrations.
+    private static func findAllTextRegions(in cgImage: CGImage) -> [CGRect] {
+        let request = VNRecognizeTextRequest()
+        request.recognitionLevel = .fast
+        request.usesLanguageCorrection = false
+
+        let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+        guard (try? handler.perform([request])) != nil,
+              let results = request.results else {
+            return []
+        }
+
+        return results.map(\.boundingBox)
+    }
+
+    /// Returns true if the contour bbox overlaps significantly with any
+    /// detected text region — meaning it's likely a number or label.
+    private static func isTextContour(
+        _ bbox: CGRect,
+        textRegions: [CGRect]
+    ) -> Bool {
+        let contourArea = bbox.width * bbox.height
+        guard contourArea > 0 else { return false }
+        for textBox in textRegions {
+            let intersection = bbox.intersection(textBox)
+            guard !intersection.isNull,
+                  intersection.width > 0,
+                  intersection.height > 0 else { continue }
+            let overlapRatio = (intersection.width * intersection.height) / contourArea
+            if overlapRatio > 0.5 { return true }
+        }
+        return false
     }
 
     // MARK: - Text-guided piece extraction
@@ -117,7 +163,8 @@ enum ReferenceProcessor {
     /// 4. Finds the largest dark contour in that region — the piece
     private static func extractPiecesUsingMarkers(
         _ markers: [CGRect],
-        in cgImage: CGImage
+        in cgImage: CGImage,
+        textRegions: [CGRect]
     ) -> [ReferenceDescriptor] {
         var descriptors: [ReferenceDescriptor] = []
 
@@ -191,7 +238,8 @@ enum ReferenceProcessor {
     /// Extracts pieces using contour detection only (no text guidance).
     /// Used when no quantity markers are found in the image.
     private static func extractPiecesFromContours(
-        in cgImage: CGImage
+        in cgImage: CGImage,
+        textRegions: [CGRect]
     ) throws -> [ReferenceDescriptor] {
         let contours = try ContourDetector.detect(
             in: cgImage,
@@ -208,6 +256,10 @@ enum ReferenceProcessor {
             let bbox = contour.boundingBox
             let area = bbox.width * bbox.height
             guard area > 0.02, area < 0.60 else { continue }
+
+            // Skip contours that overlap significantly with detected text
+            // (step numbers, labels, quantity markers).
+            if isTextContour(bbox, textRegions: textRegions) { continue }
 
             if let crop = cgImage.cropping(toNormalizedRect: bbox) {
                 let centerRect = CGRect(x: 0.2, y: 0.2, width: 0.6, height: 0.6)
