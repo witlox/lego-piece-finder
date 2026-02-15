@@ -31,12 +31,13 @@ enum ReferenceProcessor {
     /// Processes a photo of a LEGO manual callout box and extracts descriptors
     /// for all piece illustrations found.
     ///
-    /// The user photographs just the piece-list callout box (the bordered area
-    /// showing required pieces with "1x", "2x" quantities). This method:
-    /// 1. Detects contours in the image
-    /// 2. Filters to piece-sized contours with non-background color
-    /// 3. Applies NMS to remove overlapping internal details
-    /// 4. Extracts shape, color, and feature print descriptors for each piece
+    /// Uses two strategies:
+    /// 1. **Text-guided** (preferred): Finds "1x", "2x" quantity markers via
+    ///    text recognition, divides the image into columns around each marker,
+    ///    and extracts the piece from each column. This reliably splits pieces
+    ///    that contour detection alone might merge.
+    /// 2. **Contour-only** (fallback): If no quantity markers are found,
+    ///    detects contours directly and filters by size and color.
     static func processAll(image: UIImage) throws -> [ReferenceDescriptor] {
         guard let rawCGImage = image.cgImage else {
             throw ProcessingError.croppingFailed
@@ -45,7 +46,149 @@ enum ReferenceProcessor {
         // Downsample to limit memory — 2000px is plenty for callout box analysis.
         let cgImage = ContourDetector.downsample(rawCGImage, maxDimension: 2000)
 
-        // Detect contours in the callout box photo
+        // Strategy 1: Text-guided extraction using quantity markers
+        let markers = findQuantityMarkers(in: cgImage)
+        if !markers.isEmpty {
+            let descriptors = extractPiecesUsingMarkers(markers, in: cgImage)
+            if !descriptors.isEmpty {
+                return descriptors
+            }
+        }
+
+        // Strategy 2: Contour-only fallback
+        let descriptors = try extractPiecesFromContours(in: cgImage)
+
+        guard !descriptors.isEmpty else {
+            throw ProcessingError.noContoursFound
+        }
+
+        return descriptors
+    }
+
+    /// Convenience: extracts a single descriptor for the largest piece found.
+    static func process(image: UIImage) throws -> ReferenceDescriptor {
+        let all = try processAll(image: image)
+        guard let first = all.first else {
+            throw ProcessingError.noContoursFound
+        }
+        return first
+    }
+
+    // MARK: - Text-guided piece extraction
+
+    /// Detects quantity marker text ("1x", "2x", etc.) in the image.
+    /// Returns their bounding boxes sorted left-to-right.
+    private static func findQuantityMarkers(in cgImage: CGImage) -> [CGRect] {
+        let request = VNRecognizeTextRequest()
+        request.recognitionLevel = .fast
+        request.usesLanguageCorrection = false
+
+        let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+        guard (try? handler.perform([request])) != nil,
+              let results = request.results else {
+            return []
+        }
+
+        var markers: [CGRect] = []
+        for observation in results {
+            guard let candidate = observation.topCandidates(1).first else { continue }
+            let text = candidate.string
+            // Match "1x", "2x", "10x", also "1×", "2×" (multiplication sign)
+            if text.range(of: #"\d+[x×X]"#, options: .regularExpression) != nil {
+                markers.append(observation.boundingBox)
+            }
+        }
+
+        return markers.sorted { $0.midX < $1.midX }
+    }
+
+    /// Extracts one piece per quantity marker by dividing the image into
+    /// columns based on marker positions.
+    ///
+    /// LEGO callout boxes arrange pieces in a row with "1x"/"2x" markers
+    /// below each piece. This method:
+    /// 1. Sorts markers left-to-right
+    /// 2. Computes column boundaries (midpoints between adjacent markers)
+    /// 3. For each column, crops the region above the marker
+    /// 4. Finds the largest dark contour in that region — the piece
+    private static func extractPiecesUsingMarkers(
+        _ markers: [CGRect],
+        in cgImage: CGImage
+    ) -> [ReferenceDescriptor] {
+        var descriptors: [ReferenceDescriptor] = []
+
+        for (i, marker) in markers.enumerated() {
+            // Column left edge: midpoint to previous marker, or image edge
+            let leftEdge: CGFloat
+            if i == 0 {
+                leftEdge = 0
+            } else {
+                leftEdge = (markers[i - 1].midX + marker.midX) / 2
+            }
+
+            // Column right edge: midpoint to next marker, or image edge
+            let rightEdge: CGFloat
+            if i == markers.count - 1 {
+                rightEdge = 1.0
+            } else {
+                rightEdge = (marker.midX + markers[i + 1].midX) / 2
+            }
+
+            // Search region: the column area above the marker text.
+            // In Vision coordinates (bottom-left origin), "above" = higher y.
+            let columnRect = CGRect(
+                x: leftEdge,
+                y: marker.maxY,
+                width: rightEdge - leftEdge,
+                height: 1.0 - marker.maxY
+            )
+
+            guard columnRect.width > 0.01, columnRect.height > 0.01,
+                  let regionCrop = cgImage.cropping(toNormalizedRect: columnRect) else {
+                continue
+            }
+
+            // Find piece contour in this column
+            guard let contours = try? ContourDetector.detect(
+                in: regionCrop,
+                contrastAdjustment: 3.0,
+                maxCount: 5
+            ), !contours.isEmpty else { continue }
+
+            // Take the largest contour that's dark enough (not background)
+            for contour in contours {
+                let bbox = contour.boundingBox
+                let area = bbox.width * bbox.height
+                guard area > 0.03 else { continue }
+
+                // Check it's not background
+                if let crop = regionCrop.cropping(toNormalizedRect: bbox) {
+                    let centerRect = CGRect(x: 0.2, y: 0.2, width: 0.6, height: 0.6)
+                    if let color = ColorAnalyzer.dominantColor(
+                        of: crop,
+                        inNormalizedRect: centerRect
+                    ) {
+                        guard color.lab.L < 85 else { continue }
+                    }
+                }
+
+                if let descriptor = try? processSingleContour(contour, in: regionCrop) {
+                    descriptors.append(descriptor)
+                    break // one piece per marker
+                }
+            }
+        }
+
+        return descriptors
+    }
+
+    // MARK: - Contour-only fallback
+
+    /// Extracts pieces using contour detection only (no text guidance).
+    /// Used when no quantity markers are found in the image.
+    private static func extractPiecesFromContours(
+        in cgImage: CGImage
+    ) throws -> [ReferenceDescriptor] {
         let contours = try ContourDetector.detect(
             in: cgImage,
             contrastAdjustment: 3.0,
@@ -56,16 +199,12 @@ enum ReferenceProcessor {
             throw ProcessingError.noContoursFound
         }
 
-        // Filter to piece-sized contours with dark/colored content (not background)
         var candidates: [VNContour] = []
         for contour in contours {
             let bbox = contour.boundingBox
             let area = bbox.width * bbox.height
-            // Pieces in a callout box photo are typically 2-60% of the image
             guard area > 0.02, area < 0.60 else { continue }
 
-            // Reject contours whose center is too light — these are background
-            // regions, text labels, or quantity markers, not piece illustrations.
             if let crop = cgImage.cropping(toNormalizedRect: bbox) {
                 let centerRect = CGRect(x: 0.2, y: 0.2, width: 0.6, height: 0.6)
                 if let color = ColorAnalyzer.dominantColor(
@@ -79,8 +218,7 @@ enum ReferenceProcessor {
             candidates.append(contour)
         }
 
-        // Non-maximum suppression: remove contours whose bbox is mostly inside
-        // a larger contour's bbox (stud circles inside a brick outline).
+        // Non-maximum suppression
         candidates.sort {
             let a = $0.boundingBox; let b = $1.boundingBox
             return (a.width * a.height) > (b.width * b.height)
@@ -105,22 +243,7 @@ enum ReferenceProcessor {
             }
         }
 
-        let descriptors = kept.compactMap { try? processSingleContour($0, in: cgImage) }
-
-        guard !descriptors.isEmpty else {
-            throw ProcessingError.noContoursFound
-        }
-
-        return descriptors
-    }
-
-    /// Convenience: extracts a single descriptor for the largest piece found.
-    static func process(image: UIImage) throws -> ReferenceDescriptor {
-        let all = try processAll(image: image)
-        guard let first = all.first else {
-            throw ProcessingError.noContoursFound
-        }
-        return first
+        return kept.compactMap { try? processSingleContour($0, in: cgImage) }
     }
 
     // MARK: - Single contour processing
