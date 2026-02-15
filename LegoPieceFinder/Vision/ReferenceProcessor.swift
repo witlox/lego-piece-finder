@@ -39,7 +39,11 @@ enum ReferenceProcessor {
     /// 2. **Contour-only** (fallback): If no quantity markers are found,
     ///    detects contours directly and filters by size and color.
     static func processAll(image: UIImage) throws -> [ReferenceDescriptor] {
-        guard let rawCGImage = image.cgImage else {
+        // Normalize orientation first — UIImage.cgImage returns raw pixels
+        // without applying imageOrientation, so a rotated iPad would produce
+        // a sideways image breaking text recognition and column splitting.
+        let normalized = image.normalizedOrientation()
+        guard let rawCGImage = normalized.cgImage else {
             throw ProcessingError.croppingFailed
         }
 
