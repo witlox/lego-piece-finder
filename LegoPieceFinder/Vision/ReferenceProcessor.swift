@@ -116,9 +116,11 @@ enum ReferenceProcessor {
     /// - Center contrast: the center region differs from the edge background
     ///   (CIELAB distance > 5), indicating piece illustrations inside
     /// - Not page white (average edge L < 92)
+    /// - Not orange/amber sub-assembly box (a* > 10 and b* > 25 in CIELAB)
     ///
     /// Rejects build illustrations (varied colors → high edge distance),
-    /// page background (L > 92), and small decorative elements (area filter).
+    /// page background (L > 92), orange sub-assembly boxes (universal LEGO
+    /// design: amber background with numbered steps), and small elements.
     private static func findCalloutBoxes(
         from contours: [VNContour],
         in cgImage: CGImage
@@ -171,6 +173,13 @@ enum ReferenceProcessor {
 
             // Reject page white — the page itself is not a callout box
             guard avgL < 92 else { continue }
+
+            // Reject orange/amber sub-assembly boxes. These are a universal
+            // LEGO design standard (same amber color across ALL manuals) used
+            // for numbered sub-assembly steps. In CIELAB, orange/amber has
+            // positive a* (toward red) and positive b* (toward yellow).
+            // Grey (a≈0,b≈0), blue (a≈0,b<0), and white all pass safely.
+            guard !(avgA > 10 && avgB > 25) else { continue }
 
             // Center contrast: piece illustrations in the center should differ
             // from the uniform background at the edges.
