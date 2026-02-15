@@ -12,11 +12,13 @@ struct ReferencePreviewCard: View {
                 Image(uiImage: descriptor.referenceImage)
                     .resizable()
                     .aspectRatio(contentMode: .fit)
-                    .frame(width: 48, height: 48)
+                    .frame(width: 64, height: 64)
+                    .padding(4)
+                    .background(Color.black.opacity(0.6))
                     .clipShape(RoundedRectangle(cornerRadius: 8))
                     .overlay(
                         RoundedRectangle(cornerRadius: 8)
-                            .stroke(Color(descriptor.displayColor), lineWidth: 2)
+                            .stroke(Color(descriptor.displayColor), lineWidth: 2.5)
                     )
 
                 Circle()
@@ -28,10 +30,10 @@ struct ReferencePreviewCard: View {
                 onRemove()
             } label: {
                 Image(systemName: "xmark.circle.fill")
-                    .font(.caption)
-                    .foregroundColor(.white.opacity(0.7))
+                    .font(.system(size: 16))
+                    .foregroundColor(.white.opacity(0.8))
             }
-            .offset(x: 4, y: -4)
+            .offset(x: 6, y: -6)
         }
     }
 }
@@ -61,7 +63,7 @@ struct ReferencePreviewStrip: View {
                         RoundedRectangle(cornerRadius: 8)
                             .strokeBorder(style: StrokeStyle(lineWidth: 1.5, dash: [4]))
                             .foregroundColor(.white.opacity(0.5))
-                            .frame(width: 48, height: 48)
+                            .frame(width: 64, height: 64)
                             .overlay(
                                 Image(systemName: "plus")
                                     .foregroundColor(.white.opacity(0.7))
@@ -81,7 +83,7 @@ struct ReferencePreviewStrip: View {
                         VStack(spacing: 4) {
                             RoundedRectangle(cornerRadius: 8)
                                 .fill(Color.red.opacity(0.2))
-                                .frame(width: 48, height: 48)
+                                .frame(width: 64, height: 64)
                                 .overlay(
                                     Image(systemName: "trash")
                                         .foregroundColor(.red.opacity(0.7))
