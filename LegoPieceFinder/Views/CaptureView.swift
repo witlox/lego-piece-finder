@@ -13,13 +13,13 @@ struct CaptureView: View {
             VStack(spacing: 24) {
                 Spacer()
 
-                Text("Photograph LEGO pieces\nfrom the instruction manual")
+                Text("Photograph the piece callout box\nfrom the instruction manual")
                     .font(.title2)
                     .fontWeight(.semibold)
                     .foregroundColor(.white)
                     .multilineTextAlignment(.center)
 
-                Text("Multiple pieces on one page will be\ndetected automatically. You can add more later.")
+                Text("Zoom in on the grey/colored box showing\nthe needed pieces. You can add more later.")
                     .font(.subheadline)
                     .foregroundColor(.gray)
                     .multilineTextAlignment(.center)
