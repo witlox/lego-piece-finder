@@ -13,13 +13,13 @@ struct CaptureView: View {
             VStack(spacing: 24) {
                 Spacer()
 
-                Text("Photograph a LEGO piece\nfrom the instruction manual")
+                Text("Photograph LEGO pieces\nfrom the instruction manual")
                     .font(.title2)
                     .fontWeight(.semibold)
                     .foregroundColor(.white)
                     .multilineTextAlignment(.center)
 
-                Text("Position the piece clearly in frame.\nThe illustration should be on a light background.")
+                Text("Multiple pieces on one page will be\ndetected automatically. You can add more later.")
                     .font(.subheadline)
                     .foregroundColor(.gray)
                     .multilineTextAlignment(.center)
@@ -61,7 +61,7 @@ struct CaptureView: View {
         }
         .onChange(of: capturedImage) { _, newImage in
             if let image = newImage {
-                appState.setReference(from: image)
+                appState.addReferences(from: image)
                 capturedImage = nil
             }
         }

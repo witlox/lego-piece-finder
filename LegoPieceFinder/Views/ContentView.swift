@@ -9,8 +9,8 @@ struct ContentView: View {
             case .capture:
                 CaptureView()
             case .scanning:
-                if let reference = appState.reference {
-                    ScanView(reference: reference)
+                if !appState.references.isEmpty {
+                    ScanView()
                 } else {
                     CaptureView()
                 }

@@ -3,7 +3,7 @@ import ARKit
 import RealityKit
 
 struct ARViewContainer: UIViewRepresentable {
-    let reference: ReferenceDescriptor
+    let references: [ReferenceDescriptor]
     let overlayManager: HighlightOverlayManager
     let pipeline: DetectionPipeline
     let throttler: FrameThrottler
@@ -23,11 +23,13 @@ struct ARViewContainer: UIViewRepresentable {
         return arView
     }
 
-    func updateUIView(_ uiView: ARView, context: Context) {}
+    func updateUIView(_ uiView: ARView, context: Context) {
+        context.coordinator.references = references
+    }
 
     func makeCoordinator() -> Coordinator {
         Coordinator(
-            reference: reference,
+            references: references,
             overlayManager: overlayManager,
             pipeline: pipeline,
             throttler: throttler
@@ -35,46 +37,58 @@ struct ARViewContainer: UIViewRepresentable {
     }
 
     class Coordinator: NSObject, ARSessionDelegate {
-        let reference: ReferenceDescriptor
+        var references: [ReferenceDescriptor]
         let overlayManager: HighlightOverlayManager
         let pipeline: DetectionPipeline
         let throttler: FrameThrottler
 
+        /// Single shared CIContext — these are heavyweight and thread-safe.
+        private let ciContext = CIContext()
+
+        /// Prevents spawning new tasks while one is already in-flight.
+        /// Uses UnsafeSendableBox so it can be captured safely across isolation.
+        private let taskInFlight = UnsafeSendableBox(false)
+
         init(
-            reference: ReferenceDescriptor,
+            references: [ReferenceDescriptor],
             overlayManager: HighlightOverlayManager,
             pipeline: DetectionPipeline,
             throttler: FrameThrottler
         ) {
-            self.reference = reference
+            self.references = references
             self.overlayManager = overlayManager
             self.pipeline = pipeline
             self.throttler = throttler
         }
 
         func session(_ session: ARSession, didUpdate frame: ARFrame) {
-            guard throttler.shouldProcess() else { return }
+            guard throttler.shouldProcess(), !taskInFlight.value else { return }
 
             let pixelBuffer = frame.capturedImage
             let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
-            let context = CIContext()
-            guard let cgImage = context.createCGImage(
+            guard let cgImage = ciContext.createCGImage(
                 ciImage,
                 from: ciImage.extent
             ) else { return }
 
-            let ref = reference
+            let refs = references
             let pipeline = pipeline
             let overlayManager = overlayManager
+            let inFlightFlag = taskInFlight
+
+            inFlightFlag.value = true
 
             Task {
-                guard let candidates = await pipeline.processFrame(
+                let candidates = await pipeline.processFrame(
                     cgImage: cgImage,
-                    reference: ref
-                ) else { return }
+                    references: refs
+                )
 
                 await MainActor.run {
-                    overlayManager.update(candidates: candidates)
+                    inFlightFlag.value = false
+                    if let candidates {
+                        overlayManager.update(candidates: candidates)
+                    }
                 }
             }
         }

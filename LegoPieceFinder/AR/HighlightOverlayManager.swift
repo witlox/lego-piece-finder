@@ -58,7 +58,7 @@ final class HighlightOverlayManager: ObservableObject {
 
             // Create highlight entity
             let highlight = HighlightEntity.make(
-                matchType: candidate.matchType,
+                candidate: candidate,
                 width: max(physicalWidth, 0.01),
                 height: max(physicalHeight, 0.01)
             )

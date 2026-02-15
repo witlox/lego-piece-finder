@@ -2,7 +2,6 @@ import SwiftUI
 
 struct ScanView: View {
     @EnvironmentObject var appState: AppState
-    let reference: ReferenceDescriptor
 
     @StateObject private var overlayManager = HighlightOverlayManager()
     private let pipeline = DetectionPipeline()
@@ -11,7 +10,7 @@ struct ScanView: View {
     var body: some View {
         ZStack {
             ARViewContainer(
-                reference: reference,
+                references: appState.references,
                 overlayManager: overlayManager,
                 pipeline: pipeline,
                 throttler: throttler
@@ -19,15 +18,25 @@ struct ScanView: View {
             .ignoresSafeArea()
 
             VStack {
-                ReferencePreviewCard(descriptor: reference) {
-                    overlayManager.removeAll()
-                    appState.resetToCapture()
-                }
+                ReferencePreviewStrip(
+                    references: appState.references,
+                    onRemove: { id in
+                        overlayManager.removeAll()
+                        appState.removeReference(id: id)
+                    },
+                    onAddMore: {
+                        appState.mode = .capture
+                    },
+                    onResetAll: {
+                        overlayManager.removeAll()
+                        appState.resetToCapture()
+                    }
+                )
                 .padding(.top, 8)
 
                 Spacer()
 
-                MatchLegendOverlay()
+                MatchLegendOverlay(references: appState.references)
                     .padding(.bottom, 24)
             }
         }
