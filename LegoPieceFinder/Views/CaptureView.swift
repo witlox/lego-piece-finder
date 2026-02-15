@@ -87,8 +87,13 @@ struct ImagePicker: UIViewControllerRepresentable {
         picker.sourceType = .camera
         picker.delegate = context.coordinator
 
-        // Add the guide overlay on top of the camera preview
+        // Add the guide overlay on top of the camera preview.
+        // The frame must be set explicitly — UIImagePickerController
+        // does not auto-size the overlay view.
+        let screenBounds = UIScreen.main.bounds
         let overlay = CropGuideOverlay(cropFraction: cropFraction)
+        overlay.frame = screenBounds
+        overlay.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         overlay.isUserInteractionEnabled = false
         picker.cameraOverlayView = overlay
 
