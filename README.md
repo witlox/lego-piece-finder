@@ -45,7 +45,27 @@ xcodegen generate
 open LegoPieceFinder.xcodeproj
 ```
 
-Build for a physical device to use the AR scanning features. The capture flow works in the simulator.
+## Installing on iPhone / iPad
+
+AR scanning requires a physical device. Follow these steps to install the app:
+
+1. **Connect your device** to your Mac with a USB cable
+2. **Open the project** in Xcode (`open LegoPieceFinder.xcodeproj`)
+3. **Set your development team:**
+   - Select the `LegoPieceFinder` project in the navigator
+   - Go to the **Signing & Capabilities** tab
+   - Check **Automatically manage signing**
+   - Select your team from the **Team** dropdown (use your personal Apple ID if you don't have a paid developer account)
+4. **Select your device** from the device dropdown in the Xcode toolbar (top bar, next to the scheme name)
+5. **Trust the developer profile** on your device (first install only):
+   - On your iPhone/iPad go to **Settings > General > VPN & Device Management**
+   - Tap your developer profile and tap **Trust**
+6. **Build and run** by pressing **Cmd+R** or clicking the play button
+
+**Notes:**
+- A free Apple ID works for development, but apps expire after 7 days and must be reinstalled. A paid Apple Developer account ($99/year) removes this limit.
+- When prompted, allow camera access — the app needs it for both capturing manual photos and AR scanning.
+- The device must support ARKit (iPhone 6s or later, most iPads from 2017+).
 
 ## Project Structure
 
