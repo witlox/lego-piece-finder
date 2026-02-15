@@ -153,106 +153,126 @@ enum ReferenceProcessor {
         return false
     }
 
-    /// Extracts one piece per quantity marker by dividing the image into
-    /// columns based on marker positions.
+    /// Extracts one piece per quantity marker using grid-based splitting.
     ///
-    /// LEGO callout boxes arrange pieces in a row with "1x"/"2x" markers
-    /// below each piece. This method:
-    /// 1. Sorts markers left-to-right
-    /// 2. Computes column boundaries (midpoints between adjacent markers)
-    /// 3. For each column, crops the region above the marker
-    /// 4. Finds the largest dark contour in that region — the piece
+    /// LEGO callout boxes arrange pieces in a grid. Each marker ("1x", "2x")
+    /// sits underneath and to the left of its piece. This method:
+    /// 1. Clusters markers by x-position into columns
+    /// 2. Within each column, sorts by y-position into rows
+    /// 3. For each marker, computes a cell region (above the marker, bounded
+    ///    by the next row/column or image edge)
+    /// 4. Finds the largest dark contour in each cell — the piece
     private static func extractPiecesUsingMarkers(
         _ markers: [CGRect],
         in cgImage: CGImage,
         textRegions: [CGRect]
     ) -> [ReferenceDescriptor] {
+
+        // ── Step 1: Cluster markers into grid columns by x-position ──
+        // Sort by midX, then group markers within 15% of image width.
+        let sorted = markers.sorted { $0.midX < $1.midX }
+        let clusterThreshold: CGFloat = 0.15
+        var columns: [[CGRect]] = []
+        for marker in sorted {
+            if let lastIdx = columns.indices.last,
+               abs(columns[lastIdx].last!.midX - marker.midX) < clusterThreshold {
+                columns[lastIdx].append(marker)
+            } else {
+                columns.append([marker])
+            }
+        }
+
+        // Sort each column by y (bottom to top in Vision coords)
+        for i in columns.indices {
+            columns[i].sort { $0.midY < $1.midY }
+        }
+
+        // ── Step 2: Compute column x-boundaries (midpoints between columns) ──
+        let columnMidXs = columns.map { col in
+            col.map(\.midX).reduce(0, +) / CGFloat(col.count)
+        }
+        var colLeftEdges: [CGFloat] = []
+        var colRightEdges: [CGFloat] = []
+        for ci in columns.indices {
+            let left: CGFloat = ci == 0 ? 0 : (columnMidXs[ci - 1] + columnMidXs[ci]) / 2
+            let right: CGFloat = ci == columns.count - 1 ? 1.0 : (columnMidXs[ci] + columnMidXs[ci + 1]) / 2
+            colLeftEdges.append(left)
+            colRightEdges.append(right)
+        }
+
+        print("[RefProc] grid: \(columns.count) cols × \(columns.map(\.count).max() ?? 0) rows")
+
+        // ── Step 3: For each marker, compute cell and extract piece ──
         var descriptors: [ReferenceDescriptor] = []
+        var pieceIdx = 0
 
-        for (i, marker) in markers.enumerated() {
-            // Column left edge: midpoint to previous marker, or image edge
-            let leftEdge: CGFloat
-            if i == 0 {
-                leftEdge = 0
-            } else {
-                leftEdge = (markers[i - 1].midX + marker.midX) / 2
-            }
+        for (ci, column) in columns.enumerated() {
+            for (ri, marker) in column.enumerated() {
+                // Cell bottom: just above the marker text
+                let cellBottom = marker.maxY
+                // Cell top: bottom of the next row's marker, or image top
+                let cellTop: CGFloat
+                if ri < column.count - 1 {
+                    cellTop = column[ri + 1].minY
+                } else {
+                    cellTop = 1.0
+                }
 
-            // Column right edge: midpoint to next marker, or image edge
-            let rightEdge: CGFloat
-            if i == markers.count - 1 {
-                rightEdge = 1.0
-            } else {
-                rightEdge = (marker.midX + markers[i + 1].midX) / 2
-            }
+                let cellRect = CGRect(
+                    x: colLeftEdges[ci],
+                    y: cellBottom,
+                    width: colRightEdges[ci] - colLeftEdges[ci],
+                    height: cellTop - cellBottom
+                )
 
-            // Search region: the column area above the marker text.
-            // In Vision coordinates (bottom-left origin), "above" = higher y.
-            let columnRect = CGRect(
-                x: leftEdge,
-                y: marker.maxY,
-                width: rightEdge - leftEdge,
-                height: 1.0 - marker.maxY
-            )
+                print("[RefProc] piece[\(pieceIdx)] col=\(ci) row=\(ri) cell=\(cellRect)")
 
-            print("[RefProc] marker[\(i)] column: \(columnRect)")
-
-            guard columnRect.width > 0.01, columnRect.height > 0.01,
-                  let regionCrop = cgImage.cropping(toNormalizedRect: columnRect) else {
-                print("[RefProc] marker[\(i)] column crop failed")
-                continue
-            }
-
-            print("[RefProc] marker[\(i)] regionCrop: \(regionCrop.width)×\(regionCrop.height)")
-
-            // Find piece contour in this column
-            guard let contours = try? ContourDetector.detect(
-                in: regionCrop,
-                contrastAdjustment: 3.0,
-                maxCount: 5
-            ), !contours.isEmpty else {
-                print("[RefProc] marker[\(i)] no contours in column")
-                continue
-            }
-
-            print("[RefProc] marker[\(i)] \(contours.count) contours in column")
-
-            // Take the largest contour that's dark enough (not background)
-            var foundPiece = false
-            for contour in contours {
-                let bbox = contour.boundingBox
-                let area = bbox.width * bbox.height
-                // Within a column crop, a piece can be relatively small
-                guard area > 0.01 else {
-                    print("[RefProc]   contour area \(area) < 0.01, skip")
+                guard cellRect.width > 0.01, cellRect.height > 0.01,
+                      let regionCrop = cgImage.cropping(toNormalizedRect: cellRect) else {
+                    print("[RefProc] piece[\(pieceIdx)] cell crop failed")
+                    pieceIdx += 1
                     continue
                 }
 
-                // Check it's not background
-                if let crop = regionCrop.cropping(toNormalizedRect: bbox) {
-                    let centerRect = CGRect(x: 0.2, y: 0.2, width: 0.6, height: 0.6)
-                    if let color = ColorAnalyzer.dominantColor(
-                        of: crop,
-                        inNormalizedRect: centerRect
-                    ) {
-                        if color.lab.L >= 85 {
-                            print("[RefProc]   contour L=\(color.lab.L) >= 85, skip (too light)")
-                            continue
-                        }
-                        print("[RefProc]   contour area=\(area) L=\(color.lab.L) — accepted")
-                    }
+                print("[RefProc] piece[\(pieceIdx)] crop: \(regionCrop.width)×\(regionCrop.height)")
+
+                guard let contours = try? ContourDetector.detect(
+                    in: regionCrop,
+                    contrastAdjustment: 3.0,
+                    maxCount: 5
+                ), !contours.isEmpty else {
+                    print("[RefProc] piece[\(pieceIdx)] no contours")
+                    pieceIdx += 1
+                    continue
                 }
 
-                if let descriptor = try? processSingleContour(contour, in: regionCrop) {
-                    descriptors.append(descriptor)
-                    foundPiece = true
-                    break // one piece per marker
-                } else {
-                    print("[RefProc]   processSingleContour failed for contour")
+                var foundPiece = false
+                for contour in contours {
+                    let bbox = contour.boundingBox
+                    let area = bbox.width * bbox.height
+                    guard area > 0.01 else { continue }
+
+                    if let crop = regionCrop.cropping(toNormalizedRect: bbox) {
+                        let centerRect = CGRect(x: 0.2, y: 0.2, width: 0.6, height: 0.6)
+                        if let color = ColorAnalyzer.dominantColor(
+                            of: crop,
+                            inNormalizedRect: centerRect
+                        ) {
+                            if color.lab.L >= 85 { continue }
+                            print("[RefProc] piece[\(pieceIdx)] area=\(area) L=\(color.lab.L) — ok")
+                        }
+                    }
+
+                    if let descriptor = try? processSingleContour(contour, in: regionCrop) {
+                        descriptors.append(descriptor)
+                        foundPiece = true
+                        break
+                    }
                 }
-            }
-            if !foundPiece {
-                print("[RefProc] marker[\(i)] no valid piece found")
+                if !foundPiece {
+                    print("[RefProc] piece[\(pieceIdx)] no valid contour")
+                }
+                pieceIdx += 1
             }
         }
 
