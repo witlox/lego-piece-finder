@@ -88,12 +88,10 @@ struct ImagePicker: UIViewControllerRepresentable {
         picker.delegate = context.coordinator
 
         // Add the guide overlay on top of the camera preview.
-        // The frame must be set explicitly — UIImagePickerController
-        // does not auto-size the overlay view.
-        let screenBounds = UIScreen.main.bounds
+        // Frame is picked up from the superview in didMoveToSuperview —
+        // we can't know the preview size here because the picker hasn't
+        // been added to the view hierarchy yet.
         let overlay = CropGuideOverlay(cropFraction: cropFraction)
-        overlay.frame = screenBounds
-        overlay.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         overlay.isUserInteractionEnabled = false
         picker.cameraOverlayView = overlay
 
@@ -149,10 +147,18 @@ final class CropGuideOverlay: UIView {
         fatalError("init(coder:) has not been implemented")
     }
 
+    override func didMoveToSuperview() {
+        super.didMoveToSuperview()
+        // Match the camera preview bounds — UIImagePickerController adds
+        // the overlay as a subview of its preview area.
+        if let superview = superview {
+            frame = superview.bounds
+            autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        }
+    }
+
     override func layoutSubviews() {
         super.layoutSubviews()
-        // Resize to match the camera preview area (full screen minus controls).
-        // UIImagePickerController sets the overlay frame automatically.
         setNeedsDisplay()
     }
 
@@ -218,18 +224,7 @@ final class CropGuideOverlay: UIView {
             ctx.strokePath()
         }
 
-        // Label
-        let label = "Position piece box here" as NSString
-        let attrs: [NSAttributedString.Key: Any] = [
-            .foregroundColor: UIColor.white.withAlphaComponent(0.8),
-            .font: UIFont.systemFont(ofSize: 15, weight: .medium),
-        ]
-        let labelSize = label.size(withAttributes: attrs)
-        let labelPoint = CGPoint(
-            x: guideRect.midX - labelSize.width / 2,
-            y: guideRect.maxY + 12
-        )
-        label.draw(at: labelPoint, withAttributes: attrs)
+        // No label here — the SwiftUI CaptureView already shows instructions.
     }
 }
 
