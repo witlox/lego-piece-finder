@@ -49,23 +49,35 @@ enum ReferenceProcessor {
 
         // Downsample to limit memory — 2000px is plenty for callout box analysis.
         let cgImage = ContourDetector.downsample(rawCGImage, maxDimension: 2000)
+        print("[RefProc] image \(cgImage.width)×\(cgImage.height)")
 
         // Detect all text regions so we can exclude contours that are just
         // text (step numbers, labels, etc.) rather than piece illustrations.
         let textRegions = findAllTextRegions(in: cgImage)
+        print("[RefProc] text regions: \(textRegions.count)")
+        for (i, r) in textRegions.enumerated() {
+            print("[RefProc]   text[\(i)]: \(r)")
+        }
 
         // Strategy 1: Text-guided extraction using quantity markers
         let markers = findQuantityMarkers(in: cgImage)
+        print("[RefProc] quantity markers: \(markers.count)")
+        for (i, m) in markers.enumerated() {
+            print("[RefProc]   marker[\(i)]: \(m)")
+        }
+
         if !markers.isEmpty {
             let descriptors = extractPiecesUsingMarkers(
                 markers, in: cgImage, textRegions: textRegions
             )
+            print("[RefProc] text-guided produced \(descriptors.count) descriptors")
             if !descriptors.isEmpty {
                 return descriptors
             }
         }
 
         // Strategy 2: Contour-only fallback
+        print("[RefProc] falling back to contour-only")
         let descriptors = try extractPiecesFromContours(
             in: cgImage, textRegions: textRegions
         )
@@ -74,6 +86,7 @@ enum ReferenceProcessor {
             throw ProcessingError.noContoursFound
         }
 
+        print("[RefProc] contour-only produced \(descriptors.count) descriptors")
         return descriptors
     }
 
@@ -143,8 +156,10 @@ enum ReferenceProcessor {
         for observation in results {
             guard let candidate = observation.topCandidates(1).first else { continue }
             let text = candidate.string
+            print("[RefProc] detected text: \"\(text)\" at \(observation.boundingBox)")
             // Match "1x", "2x", "10x", also "1×", "2×" (multiplication sign)
             if text.range(of: #"\d+[x×X]"#, options: .regularExpression) != nil {
+                print("[RefProc]   → matched as quantity marker")
                 markers.append(observation.boundingBox)
             }
         }
@@ -194,23 +209,37 @@ enum ReferenceProcessor {
                 height: 1.0 - marker.maxY
             )
 
+            print("[RefProc] marker[\(i)] column: \(columnRect)")
+
             guard columnRect.width > 0.01, columnRect.height > 0.01,
                   let regionCrop = cgImage.cropping(toNormalizedRect: columnRect) else {
+                print("[RefProc] marker[\(i)] column crop failed")
                 continue
             }
+
+            print("[RefProc] marker[\(i)] regionCrop: \(regionCrop.width)×\(regionCrop.height)")
 
             // Find piece contour in this column
             guard let contours = try? ContourDetector.detect(
                 in: regionCrop,
                 contrastAdjustment: 3.0,
                 maxCount: 5
-            ), !contours.isEmpty else { continue }
+            ), !contours.isEmpty else {
+                print("[RefProc] marker[\(i)] no contours in column")
+                continue
+            }
+
+            print("[RefProc] marker[\(i)] \(contours.count) contours in column")
 
             // Take the largest contour that's dark enough (not background)
+            var foundPiece = false
             for contour in contours {
                 let bbox = contour.boundingBox
                 let area = bbox.width * bbox.height
-                guard area > 0.03 else { continue }
+                guard area > 0.03 else {
+                    print("[RefProc]   contour area \(area) < 0.03, skip")
+                    continue
+                }
 
                 // Check it's not background
                 if let crop = regionCrop.cropping(toNormalizedRect: bbox) {
@@ -219,14 +248,24 @@ enum ReferenceProcessor {
                         of: crop,
                         inNormalizedRect: centerRect
                     ) {
-                        guard color.lab.L < 85 else { continue }
+                        if color.lab.L >= 85 {
+                            print("[RefProc]   contour L=\(color.lab.L) >= 85, skip (too light)")
+                            continue
+                        }
+                        print("[RefProc]   contour area=\(area) L=\(color.lab.L) — accepted")
                     }
                 }
 
                 if let descriptor = try? processSingleContour(contour, in: regionCrop) {
                     descriptors.append(descriptor)
+                    foundPiece = true
                     break // one piece per marker
+                } else {
+                    print("[RefProc]   processSingleContour failed for contour")
                 }
+            }
+            if !foundPiece {
+                print("[RefProc] marker[\(i)] no valid piece found")
             }
         }
 
@@ -252,14 +291,20 @@ enum ReferenceProcessor {
         }
 
         var candidates: [VNContour] = []
-        for contour in contours {
+        for (ci, contour) in contours.enumerated() {
             let bbox = contour.boundingBox
             let area = bbox.width * bbox.height
-            guard area > 0.02, area < 0.60 else { continue }
+            guard area > 0.02, area < 0.60 else {
+                print("[RefProc-C] contour[\(ci)] area=\(area) out of range, skip")
+                continue
+            }
 
             // Skip contours that overlap significantly with detected text
             // (step numbers, labels, quantity markers).
-            if isTextContour(bbox, textRegions: textRegions) { continue }
+            if isTextContour(bbox, textRegions: textRegions) {
+                print("[RefProc-C] contour[\(ci)] overlaps text, skip")
+                continue
+            }
 
             if let crop = cgImage.cropping(toNormalizedRect: bbox) {
                 let centerRect = CGRect(x: 0.2, y: 0.2, width: 0.6, height: 0.6)
@@ -267,12 +312,17 @@ enum ReferenceProcessor {
                     of: crop,
                     inNormalizedRect: centerRect
                 ) {
-                    guard color.lab.L < 82 else { continue }
+                    if color.lab.L >= 82 {
+                        print("[RefProc-C] contour[\(ci)] L=\(color.lab.L) >= 82, skip")
+                        continue
+                    }
+                    print("[RefProc-C] contour[\(ci)] area=\(area) L=\(color.lab.L) — kept")
                 }
             }
 
             candidates.append(contour)
         }
+        print("[RefProc-C] \(candidates.count) candidates after filtering")
 
         // Non-maximum suppression
         candidates.sort {
