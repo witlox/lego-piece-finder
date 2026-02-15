@@ -28,9 +28,16 @@ enum ReferenceProcessor {
 
     // MARK: - Multi-reference extraction
 
+    /// Minimum bbox area for a piece contour (filters text, studs, noise).
+    private static let minPieceArea: CGFloat = 0.003
+
+    /// Contours above this area are likely callout borders or page edges.
+    /// Instead of processing them directly, we descend into their children.
+    private static let largeContourArea: CGFloat = 0.08
+
     /// Processes a manual illustration photo and extracts descriptors for all visible pieces.
-    /// Filters out noise (< 0.8% area), text annotations (< 0.8%), callout borders and
-    /// page edges (> 12% area). Typical manual pieces occupy 1-10% of the photographed area.
+    /// Handles the callout-box hierarchy: if a contour is large (likely a callout border),
+    /// its child contours (the actual pieces) are processed instead.
     static func processAll(image: UIImage) throws -> [ReferenceDescriptor] {
         guard let cgImage = image.cgImage else {
             throw ProcessingError.croppingFailed
@@ -52,12 +59,24 @@ enum ReferenceProcessor {
             let bbox = contour.boundingBox
             let area = bbox.width * bbox.height
 
-            // Filter noise/text (tiny) and callout borders/page edges (large).
-            // Manual pieces typically occupy 1-10% of the photographed page.
-            guard area > 0.008, area < 0.12 else { continue }
+            guard area > minPieceArea else { continue }
 
-            if let descriptor = try? processSingleContour(contour, in: cgImage) {
-                descriptors.append(descriptor)
+            if area > largeContourArea {
+                // Large contour — likely a callout box border or page edge.
+                // Descend into children to find the actual piece illustrations.
+                for i in 0..<contour.childContourCount {
+                    guard let child = try? contour.childContour(at: i) else { continue }
+                    let childArea = child.boundingBox.width * child.boundingBox.height
+                    guard childArea > minPieceArea, childArea < largeContourArea else { continue }
+                    if let descriptor = try? processSingleContour(child, in: cgImage) {
+                        descriptors.append(descriptor)
+                    }
+                }
+            } else {
+                // Medium-sized contour — likely a piece illustration, process directly.
+                if let descriptor = try? processSingleContour(contour, in: cgImage) {
+                    descriptors.append(descriptor)
+                }
             }
         }
 
