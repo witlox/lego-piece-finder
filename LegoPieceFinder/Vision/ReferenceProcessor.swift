@@ -55,39 +55,44 @@ enum ReferenceProcessor {
         // text (step numbers, labels, etc.) rather than piece illustrations.
         let textRegions = findAllTextRegions(in: cgImage)
         print("[RefProc] text regions: \(textRegions.count)")
-        for (i, r) in textRegions.enumerated() {
-            print("[RefProc]   text[\(i)]: \(r)")
-        }
 
-        // Strategy 1: Text-guided extraction using quantity markers
+        // Run contour-only detection — this is the reliable base that finds
+        // all pieces. It may merge adjacent pieces into one contour though.
+        let contourDescriptors: [ReferenceDescriptor]
+        do {
+            contourDescriptors = try extractPiecesFromContours(
+                in: cgImage, textRegions: textRegions
+            )
+        } catch {
+            contourDescriptors = []
+        }
+        print("[RefProc] contour-only found \(contourDescriptors.count) pieces")
+
+        // Try text-guided splitting for additional pieces that contour
+        // detection may have merged. Markers let us split merged blobs.
         let markers = findQuantityMarkers(in: cgImage)
         print("[RefProc] quantity markers: \(markers.count)")
-        for (i, m) in markers.enumerated() {
-            print("[RefProc]   marker[\(i)]: \(m)")
-        }
 
-        if !markers.isEmpty {
-            let descriptors = extractPiecesUsingMarkers(
+        if markers.count > contourDescriptors.count {
+            // Markers suggest more pieces than contours found — use
+            // text-guided extraction which can split merged contours.
+            let markerDescriptors = extractPiecesUsingMarkers(
                 markers, in: cgImage, textRegions: textRegions
             )
-            print("[RefProc] text-guided produced \(descriptors.count) descriptors")
-            if !descriptors.isEmpty {
-                return descriptors
+            print("[RefProc] text-guided found \(markerDescriptors.count) pieces")
+
+            if markerDescriptors.count > contourDescriptors.count {
+                print("[RefProc] using text-guided (\(markerDescriptors.count) > \(contourDescriptors.count))")
+                return markerDescriptors
             }
         }
 
-        // Strategy 2: Contour-only fallback
-        print("[RefProc] falling back to contour-only")
-        let descriptors = try extractPiecesFromContours(
-            in: cgImage, textRegions: textRegions
-        )
-
-        guard !descriptors.isEmpty else {
+        guard !contourDescriptors.isEmpty else {
             throw ProcessingError.noContoursFound
         }
 
-        print("[RefProc] contour-only produced \(descriptors.count) descriptors")
-        return descriptors
+        print("[RefProc] using contour-only (\(contourDescriptors.count) pieces)")
+        return contourDescriptors
     }
 
     /// Convenience: extracts a single descriptor for the largest piece found.
@@ -106,7 +111,7 @@ enum ReferenceProcessor {
     /// rather than piece illustrations.
     private static func findAllTextRegions(in cgImage: CGImage) -> [CGRect] {
         let request = VNRecognizeTextRequest()
-        request.recognitionLevel = .fast
+        request.recognitionLevel = .accurate
         request.usesLanguageCorrection = false
 
         let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
@@ -143,7 +148,7 @@ enum ReferenceProcessor {
     /// Returns their bounding boxes sorted left-to-right.
     private static func findQuantityMarkers(in cgImage: CGImage) -> [CGRect] {
         let request = VNRecognizeTextRequest()
-        request.recognitionLevel = .fast
+        request.recognitionLevel = .accurate
         request.usesLanguageCorrection = false
 
         let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
