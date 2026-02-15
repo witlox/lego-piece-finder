@@ -2,7 +2,7 @@ import ARKit
 import RealityKit
 
 @MainActor
-final class HighlightOverlayManager {
+final class HighlightOverlayManager: ObservableObject {
 
     private let anchor = AnchorEntity()
     private weak var arView: ARView?

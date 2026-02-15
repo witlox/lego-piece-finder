@@ -65,6 +65,7 @@ struct ARViewContainer: UIViewRepresentable {
 
             let ref = reference
             let pipeline = pipeline
+            let overlayManager = overlayManager
 
             Task {
                 guard let candidates = await pipeline.processFrame(
@@ -73,7 +74,7 @@ struct ARViewContainer: UIViewRepresentable {
                 ) else { return }
 
                 await MainActor.run {
-                    self.overlayManager.update(candidates: candidates)
+                    overlayManager.update(candidates: candidates)
                 }
             }
         }
