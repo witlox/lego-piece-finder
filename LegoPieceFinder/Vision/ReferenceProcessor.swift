@@ -51,10 +51,10 @@ enum ReferenceProcessor {
         let cgImage = ContourDetector.downsample(rawCGImage, maxDimension: 2000)
         print("[RefProc] image \(cgImage.width)×\(cgImage.height)")
 
-        // Detect all text regions so we can exclude contours that are just
-        // text (step numbers, labels, etc.) rather than piece illustrations.
-        let textRegions = findAllTextRegions(in: cgImage)
-        print("[RefProc] text regions: \(textRegions.count)")
+        // Single text recognition pass — extract both quantity markers
+        // and all text regions (for filtering out step numbers etc.).
+        let (markers, textRegions) = recognizeText(in: cgImage)
+        print("[RefProc] text regions: \(textRegions.count), quantity markers: \(markers.count)")
 
         // Run contour-only detection — this is the reliable base that finds
         // all pieces. It may merge adjacent pieces into one contour though.
@@ -67,11 +67,6 @@ enum ReferenceProcessor {
             contourDescriptors = []
         }
         print("[RefProc] contour-only found \(contourDescriptors.count) pieces")
-
-        // Try text-guided splitting for additional pieces that contour
-        // detection may have merged. Markers let us split merged blobs.
-        let markers = findQuantityMarkers(in: cgImage)
-        print("[RefProc] quantity markers: \(markers.count)")
 
         if markers.count > contourDescriptors.count {
             // Markers suggest more pieces than contours found — use
@@ -104,12 +99,14 @@ enum ReferenceProcessor {
         return first
     }
 
-    // MARK: - Text detection
+    // MARK: - Text detection (single pass)
 
-    /// Detects all text bounding boxes in the image.
-    /// Used to filter out contours that are text (step numbers, labels)
-    /// rather than piece illustrations.
-    private static func findAllTextRegions(in cgImage: CGImage) -> [CGRect] {
+    /// Runs text recognition once and returns both quantity markers and
+    /// all text bounding boxes. Using a single pass avoids running the
+    /// expensive `.accurate` neural network twice.
+    private static func recognizeText(
+        in cgImage: CGImage
+    ) -> (markers: [CGRect], allText: [CGRect]) {
         let request = VNRecognizeTextRequest()
         request.recognitionLevel = .accurate
         request.usesLanguageCorrection = false
@@ -117,10 +114,24 @@ enum ReferenceProcessor {
         let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
         guard (try? handler.perform([request])) != nil,
               let results = request.results else {
-            return []
+            return ([], [])
         }
 
-        return results.map(\.boundingBox)
+        var markers: [CGRect] = []
+        var allText: [CGRect] = []
+
+        for observation in results {
+            allText.append(observation.boundingBox)
+            guard let candidate = observation.topCandidates(1).first else { continue }
+            let text = candidate.string
+            print("[RefProc] text: \"\(text)\" at \(observation.boundingBox)")
+            if text.range(of: #"^\d+[x×X]$"#, options: .regularExpression) != nil {
+                print("[RefProc]   → quantity marker")
+                markers.append(observation.boundingBox)
+            }
+        }
+
+        return (markers.sorted { $0.midX < $1.midX }, allText)
     }
 
     /// Returns true if the contour bbox overlaps significantly with any
@@ -140,36 +151,6 @@ enum ReferenceProcessor {
             if overlapRatio > 0.5 { return true }
         }
         return false
-    }
-
-    // MARK: - Text-guided piece extraction
-
-    /// Detects quantity marker text ("1x", "2x", etc.) in the image.
-    /// Returns their bounding boxes sorted left-to-right.
-    private static func findQuantityMarkers(in cgImage: CGImage) -> [CGRect] {
-        let request = VNRecognizeTextRequest()
-        request.recognitionLevel = .accurate
-        request.usesLanguageCorrection = false
-
-        let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
-        guard (try? handler.perform([request])) != nil,
-              let results = request.results else {
-            return []
-        }
-
-        var markers: [CGRect] = []
-        for observation in results {
-            guard let candidate = observation.topCandidates(1).first else { continue }
-            let text = candidate.string
-            print("[RefProc] detected text: \"\(text)\" at \(observation.boundingBox)")
-            // Match "1x", "2x", "10x", also "1×", "2×" (multiplication sign)
-            if text.range(of: #"\d+[x×X]"#, options: .regularExpression) != nil {
-                print("[RefProc]   → matched as quantity marker")
-                markers.append(observation.boundingBox)
-            }
-        }
-
-        return markers.sorted { $0.midX < $1.midX }
     }
 
     /// Extracts one piece per quantity marker by dividing the image into
