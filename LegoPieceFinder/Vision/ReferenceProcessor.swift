@@ -48,21 +48,33 @@ enum ReferenceProcessor {
         // Full iPad photos can be 12MP+ which causes OOM during feature extraction.
         let cgImage = ContourDetector.downsample(rawCGImage, maxDimension: 2000)
 
-        // Step 1: Detect contours on the full page
+        // Step 1: Find quantity markers ("1x", "2x", etc.) via text recognition.
+        // These are the definitive identifier for piece-list callout boxes.
+        let quantityMarkers = findQuantityMarkers(in: cgImage)
+
+        // Step 2: Detect contours on the full page
         let pageContours = try ContourDetector.detect(
             in: cgImage,
             contrastAdjustment: 3.0,
-            maxCount: 20
+            maxCount: 30
         )
 
         guard !pageContours.isEmpty else {
             throw ProcessingError.noContoursFound
         }
 
-        // Step 2: Find all piece-list callout boxes (color-agnostic)
-        let calloutBoxes = findCalloutBoxes(from: pageContours, in: cgImage)
+        // Step 3: Sample the page background color (from corners)
+        let pageBackground = samplePageBackground(in: cgImage)
 
-        // Step 3: Extract pieces from each callout box
+        // Step 4: Find callout boxes that contain quantity markers
+        let calloutBoxes = findCalloutBoxes(
+            from: pageContours,
+            in: cgImage,
+            quantityMarkers: quantityMarkers,
+            pageBackground: pageBackground
+        )
+
+        // Step 5: Extract pieces from each callout box
         var descriptors: [ReferenceDescriptor] = []
         if !calloutBoxes.isEmpty {
             for box in calloutBoxes {
@@ -75,7 +87,7 @@ enum ReferenceProcessor {
             }
         }
 
-        // Step 4: Fallback — if no callout boxes found or they produced no pieces,
+        // Step 6: Fallback — if no callout boxes found or they produced no pieces,
         // the user likely zoomed into a callout box. Process the full image.
         if descriptors.isEmpty {
             if let pieces = try? extractPieces(from: cgImage, backgroundColor: nil) {
@@ -99,6 +111,66 @@ enum ReferenceProcessor {
         return first
     }
 
+    // MARK: - Text recognition for quantity markers
+
+    /// Detects quantity marker text ("1x", "2x", "3x", etc.) on the page.
+    /// Returns their bounding boxes in Vision normalized coordinates.
+    /// These markers are the definitive identifier for piece-list callout boxes.
+    private static func findQuantityMarkers(in cgImage: CGImage) -> [CGRect] {
+        let request = VNRecognizeTextRequest()
+        request.recognitionLevel = .fast
+        request.usesLanguageCorrection = false
+
+        let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+        guard (try? handler.perform([request])) != nil,
+              let results = request.results else {
+            return []
+        }
+
+        var markers: [CGRect] = []
+        for observation in results {
+            guard let candidate = observation.topCandidates(1).first else { continue }
+            let text = candidate.string
+            // Match "1x", "2x", "10x", also "1×", "2×" (multiplication sign)
+            if text.range(of: #"\d+[x×X]"#, options: .regularExpression) != nil {
+                markers.append(observation.boundingBox)
+            }
+        }
+
+        return markers
+    }
+
+    // MARK: - Page background sampling
+
+    /// Samples the page background color from corner regions.
+    private static func samplePageBackground(in cgImage: CGImage) -> CIELABColor {
+        let cornerRects = [
+            CGRect(x: 0.0, y: 0.9, width: 0.1, height: 0.1),   // top-left
+            CGRect(x: 0.9, y: 0.9, width: 0.1, height: 0.1),   // top-right
+            CGRect(x: 0.0, y: 0.0, width: 0.1, height: 0.1),   // bottom-left
+            CGRect(x: 0.9, y: 0.0, width: 0.1, height: 0.1),   // bottom-right
+        ]
+
+        var colors: [CIELABColor] = []
+        for rect in cornerRects {
+            if let color = ColorAnalyzer.dominantColor(
+                of: cgImage,
+                inNormalizedRect: rect
+            ) {
+                colors.append(color.lab)
+            }
+        }
+
+        guard !colors.isEmpty else {
+            return CIELABColor(L: 95, a: 0, b: 0) // assume white
+        }
+
+        let avgL = colors.map(\.L).reduce(0, +) / CGFloat(colors.count)
+        let avgA = colors.map(\.a).reduce(0, +) / CGFloat(colors.count)
+        let avgB = colors.map(\.b).reduce(0, +) / CGFloat(colors.count)
+        return CIELABColor(L: avgL, a: avgA, b: avgB)
+    }
+
     // MARK: - Callout box detection
 
     /// A detected callout box: its cropped image and the background color.
@@ -107,99 +179,95 @@ enum ReferenceProcessor {
         let backgroundColor: CIELABColor
     }
 
-    /// Finds all piece-list callout boxes on a LEGO manual page.
+    /// Finds piece-list callout boxes on a LEGO manual page.
     ///
-    /// Uses structural properties instead of hardcoded colors, because
-    /// callout box backgrounds vary between manuals (grey, blue, white, etc.)
-    /// but are consistent within a single manual.
-    ///
-    /// Detection criteria:
-    /// - Area 1.5-35% of the page
-    /// - Uniform edge color: 4 edge strips (top/bottom/left/right) all have
-    ///   similar CIELAB color (max pairwise distance < 25)
-    /// - Center contrast: the center region differs from the edge background
-    ///   (CIELAB distance > 5), indicating piece illustrations inside
-    /// - Not page white (average edge L < 92)
-    /// - Not orange/amber sub-assembly box (a* > 10 and b* > 25 in CIELAB)
-    ///
-    /// Rejects build illustrations (varied colors → high edge distance),
-    /// page background (L > 92), orange sub-assembly boxes (universal LEGO
-    /// design: amber background with numbered steps), and small elements.
+    /// Uses two primary signals:
+    /// 1. **Quantity markers**: Boxes must contain "1x", "2x", etc. text —
+    ///    the definitive identifier for piece-list boxes in all LEGO manuals.
+    /// 2. **Least contrasting background**: Among boxes containing markers,
+    ///    piece-list boxes have the background closest to the page color
+    ///    (grey on white page, light blue on white page, etc.), unlike
+    ///    orange sub-assembly boxes which are intentionally high-contrast.
     private static func findCalloutBoxes(
         from contours: [VNContour],
-        in cgImage: CGImage
+        in cgImage: CGImage,
+        quantityMarkers: [CGRect],
+        pageBackground: CIELABColor
     ) -> [CalloutBox] {
-        var boxes: [CalloutBox] = []
+        // Collect all candidate boxes that contain quantity marker text
+        var candidates: [(box: CalloutBox, pageDistance: CGFloat)] = []
 
         for contour in contours {
             let bbox = contour.boundingBox
             let area = bbox.width * bbox.height
-            guard area > 0.015, area < 0.35 else { continue }
+            guard area > 0.005, area < 0.35 else { continue }
+
+            // Must contain at least one quantity marker center point.
+            // Use a slightly enlarged bbox to account for contour imprecision.
+            let enlarged = bbox.insetBy(dx: -0.02, dy: -0.02)
+            let markerCount = quantityMarkers.filter { marker in
+                let center = CGPoint(x: marker.midX, y: marker.midY)
+                return enlarged.contains(center)
+            }.count
+            guard markerCount > 0 else { continue }
 
             guard let crop = cgImage.cropping(toNormalizedRect: bbox) else { continue }
 
-            // Sample 4 edge strips to check for a uniform background
-            let edgeRects = [
-                CGRect(x: 0.05, y: 0.85, width: 0.9, height: 0.1),  // top
-                CGRect(x: 0.05, y: 0.05, width: 0.9, height: 0.1),  // bottom
-                CGRect(x: 0.05, y: 0.15, width: 0.1, height: 0.7),  // left
-                CGRect(x: 0.85, y: 0.15, width: 0.1, height: 0.7),  // right
-            ]
+            // Compute background color from edges
+            let bgColor = boxBackgroundColor(of: crop)
 
-            var edgeColors: [CIELABColor] = []
-            for rect in edgeRects {
-                if let color = ColorAnalyzer.dominantColor(
-                    of: crop,
-                    inNormalizedRect: rect
-                ) {
-                    edgeColors.append(color.lab)
-                }
-            }
+            // Distance from page background — piece-list boxes are the
+            // least contrasting (closest to page color)
+            let pageDist = pageBackground.distance(to: bgColor)
 
-            guard edgeColors.count >= 3 else { continue }
-
-            // Edge uniformity: all strips should have similar color.
-            // Build illustrations fail here (many different colors at edges).
-            var maxEdgeDist: CGFloat = 0
-            for i in 0..<edgeColors.count {
-                for j in (i + 1)..<edgeColors.count {
-                    let dist = edgeColors[i].distance(to: edgeColors[j])
-                    maxEdgeDist = max(maxEdgeDist, dist)
-                }
-            }
-            guard maxEdgeDist < 25 else { continue }
-
-            // Compute average edge color = background color
-            let avgL = edgeColors.map(\.L).reduce(0, +) / CGFloat(edgeColors.count)
-            let avgA = edgeColors.map(\.a).reduce(0, +) / CGFloat(edgeColors.count)
-            let avgB = edgeColors.map(\.b).reduce(0, +) / CGFloat(edgeColors.count)
-            let bgColor = CIELABColor(L: avgL, a: avgA, b: avgB)
-
-            // Reject page white — the page itself is not a callout box
-            guard avgL < 92 else { continue }
-
-            // Reject orange/amber sub-assembly boxes. These are a universal
-            // LEGO design standard (same amber color across ALL manuals) used
-            // for numbered sub-assembly steps. In CIELAB, orange/amber has
-            // positive a* (toward red) and positive b* (toward yellow).
-            // Grey (a≈0,b≈0), blue (a≈0,b<0), and white all pass safely.
-            guard !(avgA > 10 && avgB > 25) else { continue }
-
-            // Center contrast: piece illustrations in the center should differ
-            // from the uniform background at the edges.
-            let centerRect = CGRect(x: 0.25, y: 0.25, width: 0.5, height: 0.5)
-            if let centerColor = ColorAnalyzer.dominantColor(
-                of: crop,
-                inNormalizedRect: centerRect
-            ) {
-                let centerDist = bgColor.distance(to: centerColor.lab)
-                guard centerDist > 5 else { continue }
-            }
-
-            boxes.append(CalloutBox(crop: crop, backgroundColor: bgColor))
+            candidates.append((
+                box: CalloutBox(crop: crop, backgroundColor: bgColor),
+                pageDistance: pageDist
+            ))
         }
 
-        return boxes
+        guard !candidates.isEmpty else { return [] }
+
+        // Find the minimum page distance among candidates — this represents
+        // the piece-list box background color for this manual.
+        let minDist = candidates.map(\.pageDistance).min() ?? 0
+
+        // Keep all boxes within a reasonable range of the closest background.
+        // This handles pages with multiple piece-list boxes (all same color).
+        // Reject boxes that are much more contrasting (e.g., orange sub-assembly
+        // boxes that happen to have "2x" text nearby).
+        return candidates
+            .filter { $0.pageDistance <= minDist + 20 }
+            .map(\.box)
+    }
+
+    /// Computes the average background color of a box from its edge strips.
+    private static func boxBackgroundColor(of crop: CGImage) -> CIELABColor {
+        let edgeRects = [
+            CGRect(x: 0.05, y: 0.85, width: 0.9, height: 0.1),
+            CGRect(x: 0.05, y: 0.05, width: 0.9, height: 0.1),
+            CGRect(x: 0.05, y: 0.15, width: 0.1, height: 0.7),
+            CGRect(x: 0.85, y: 0.15, width: 0.1, height: 0.7),
+        ]
+
+        var colors: [CIELABColor] = []
+        for rect in edgeRects {
+            if let color = ColorAnalyzer.dominantColor(
+                of: crop,
+                inNormalizedRect: rect
+            ) {
+                colors.append(color.lab)
+            }
+        }
+
+        guard !colors.isEmpty else {
+            return ColorAnalyzer.dominantColor(of: crop).lab
+        }
+
+        let avgL = colors.map(\.L).reduce(0, +) / CGFloat(colors.count)
+        let avgA = colors.map(\.a).reduce(0, +) / CGFloat(colors.count)
+        let avgB = colors.map(\.b).reduce(0, +) / CGFloat(colors.count)
+        return CIELABColor(L: avgL, a: avgA, b: avgB)
     }
 
     // MARK: - Piece extraction within a callout box
