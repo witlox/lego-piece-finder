@@ -38,6 +38,7 @@ enum ReferenceProcessor {
     /// Processes a manual illustration photo and extracts descriptors for all visible pieces.
     /// Handles the callout-box hierarchy: if a contour is large (likely a callout border),
     /// its child contours (the actual pieces) are processed instead.
+    /// Applies non-maximum suppression to remove overlapping internal details (studs, face edges).
     static func processAll(image: UIImage) throws -> [ReferenceDescriptor] {
         guard let cgImage = image.cgImage else {
             throw ProcessingError.croppingFailed
@@ -53,7 +54,8 @@ enum ReferenceProcessor {
             throw ProcessingError.noContoursFound
         }
 
-        var descriptors: [ReferenceDescriptor] = []
+        // Collect piece-sized candidate contours from all hierarchy levels
+        var candidates: [VNContour] = []
 
         for contour in contours {
             let bbox = contour.boundingBox
@@ -68,15 +70,43 @@ enum ReferenceProcessor {
                     guard let child = try? contour.childContour(at: i) else { continue }
                     let childArea = child.boundingBox.width * child.boundingBox.height
                     guard childArea > minPieceArea, childArea < largeContourArea else { continue }
-                    if let descriptor = try? processSingleContour(child, in: cgImage) {
-                        descriptors.append(descriptor)
-                    }
+                    candidates.append(child)
                 }
             } else {
-                // Medium-sized contour — likely a piece illustration, process directly.
-                if let descriptor = try? processSingleContour(contour, in: cgImage) {
-                    descriptors.append(descriptor)
+                candidates.append(contour)
+            }
+        }
+
+        // Non-maximum suppression: remove contours whose bbox is mostly inside a
+        // larger contour's bbox (e.g. stud circles inside a brick outline).
+        // Sort largest-first so we keep piece outlines and drop internal details.
+        candidates.sort {
+            let a = $0.boundingBox; let b = $1.boundingBox
+            return (a.width * a.height) > (b.width * b.height)
+        }
+
+        var kept: [VNContour] = []
+        for candidate in candidates {
+            let cBox = candidate.boundingBox
+            let cArea = cBox.width * cBox.height
+            let dominated = kept.contains { larger in
+                let intersection = cBox.intersection(larger.boundingBox)
+                guard !intersection.isNull, intersection.width > 0, intersection.height > 0 else {
+                    return false
                 }
+                let overlapArea = intersection.width * intersection.height
+                return overlapArea / cArea > 0.5
+            }
+            if !dominated {
+                kept.append(candidate)
+            }
+        }
+
+        // Process surviving contours into descriptors
+        var descriptors: [ReferenceDescriptor] = []
+        for contour in kept {
+            if let descriptor = try? processSingleContour(contour, in: cgImage) {
+                descriptors.append(descriptor)
             }
         }
 
