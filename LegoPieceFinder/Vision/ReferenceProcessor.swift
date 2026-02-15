@@ -241,8 +241,9 @@ enum ReferenceProcessor {
             for contour in contours {
                 let bbox = contour.boundingBox
                 let area = bbox.width * bbox.height
-                guard area > 0.03 else {
-                    print("[RefProc]   contour area \(area) < 0.03, skip")
+                // Within a column crop, a piece can be relatively small
+                guard area > 0.01 else {
+                    print("[RefProc]   contour area \(area) < 0.01, skip")
                     continue
                 }
 
@@ -299,7 +300,8 @@ enum ReferenceProcessor {
         for (ci, contour) in contours.enumerated() {
             let bbox = contour.boundingBox
             let area = bbox.width * bbox.height
-            guard area > 0.02, area < 0.60 else {
+            // Min 1% to skip studs/details; max 40% to skip the box border
+            guard area > 0.01, area < 0.40 else {
                 print("[RefProc-C] contour[\(ci)] area=\(area) out of range, skip")
                 continue
             }
