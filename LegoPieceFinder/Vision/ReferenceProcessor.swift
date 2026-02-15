@@ -28,58 +28,89 @@ enum ReferenceProcessor {
 
     // MARK: - Multi-reference extraction
 
-    /// Minimum bbox area for a piece contour (filters text, studs, noise).
-    private static let minPieceArea: CGFloat = 0.003
-
-    /// Contours above this area are likely callout borders or page edges.
-    /// Instead of processing them directly, we descend into their children.
-    private static let largeContourArea: CGFloat = 0.08
-
-    /// Processes a manual illustration photo and extracts descriptors for all visible pieces.
-    /// Handles the callout-box hierarchy: if a contour is large (likely a callout border),
-    /// its child contours (the actual pieces) are processed instead.
-    /// Applies non-maximum suppression to remove overlapping internal details (studs, face edges).
+    /// Processes a manual page photo and extracts descriptors for all pieces in the callout box.
+    ///
+    /// LEGO manuals have a consistent layout: each step has a bordered callout box (black border,
+    /// slightly grey background) listing the needed pieces. This method:
+    /// 1. Finds the callout box on the full page (largest mid-sized rectangular contour)
+    /// 2. Crops to it — isolating pieces from wood grain, page edges, build illustrations
+    /// 3. Detects piece contours inside the callout box on its clean, uniform background
+    /// 4. Applies NMS to remove overlapping internal details (studs, face edges)
+    ///
+    /// Falls back to direct contour detection if no callout box is found (e.g. zoomed-in photo).
     static func processAll(image: UIImage) throws -> [ReferenceDescriptor] {
         guard let cgImage = image.cgImage else {
             throw ProcessingError.croppingFailed
         }
 
-        let contours = try ContourDetector.detect(
+        // Step 1: Detect contours on the full page photo
+        let pageContours = try ContourDetector.detect(
             in: cgImage,
+            contrastAdjustment: 3.0,
+            maxCount: 15
+        )
+
+        guard !pageContours.isEmpty else {
+            throw ProcessingError.noContoursFound
+        }
+
+        // Step 2: Find the callout box — the largest contour in the 3-30% area range.
+        // The callout box is always the most prominent bordered rectangle on the page,
+        // larger than piece illustrations but smaller than the page itself.
+        let calloutContour = pageContours
+            .filter {
+                let area = $0.boundingBox.width * $0.boundingBox.height
+                return area > 0.03 && area < 0.30
+            }
+            .max {
+                ($0.boundingBox.width * $0.boundingBox.height) <
+                ($1.boundingBox.width * $1.boundingBox.height)
+            }
+
+        // Step 3: Crop to the callout box and re-detect contours inside it
+        let pieceImage: CGImage
+        if let callout = calloutContour,
+           let crop = cgImage.cropping(toNormalizedRect: callout.boundingBox) {
+            pieceImage = crop
+        } else {
+            // Fallback: no callout box found (user may have zoomed into pieces).
+            // Use the full image.
+            pieceImage = cgImage
+        }
+
+        let pieceContours = try ContourDetector.detect(
+            in: pieceImage,
             contrastAdjustment: 3.0,
             maxCount: 10
         )
 
-        guard !contours.isEmpty else {
+        guard !pieceContours.isEmpty else {
             throw ProcessingError.noContoursFound
         }
 
-        // Collect piece-sized candidate contours from all hierarchy levels
+        // Step 4: Filter piece-sized contours within the callout box.
+        // Inside the crop, pieces are a larger fraction of the area (typically 3-50%).
+        // Also reject contours whose center is too light (background, not a piece).
         var candidates: [VNContour] = []
-
-        for contour in contours {
+        for contour in pieceContours {
             let bbox = contour.boundingBox
             let area = bbox.width * bbox.height
+            guard area > 0.02, area < 0.60 else { continue }
 
-            guard area > minPieceArea else { continue }
-
-            if area > largeContourArea {
-                // Large contour — likely a callout box border or page edge.
-                // Descend into children to find the actual piece illustrations.
-                for i in 0..<contour.childContourCount {
-                    guard let child = try? contour.childContour(at: i) else { continue }
-                    let childArea = child.boundingBox.width * child.boundingBox.height
-                    guard childArea > minPieceArea, childArea < largeContourArea else { continue }
-                    candidates.append(child)
+            // Lightness check: piece illustrations have dark content (L < 80).
+            // Plain background regions and text labels are very light.
+            if let crop = pieceImage.cropping(toNormalizedRect: bbox) {
+                let centerRect = CGRect(x: 0.2, y: 0.2, width: 0.6, height: 0.6)
+                if let color = ColorAnalyzer.dominantColor(of: crop, inNormalizedRect: centerRect) {
+                    guard color.lab.L < 80 else { continue }
                 }
-            } else {
-                candidates.append(contour)
             }
+
+            candidates.append(contour)
         }
 
-        // Non-maximum suppression: remove contours whose bbox is mostly inside a
-        // larger contour's bbox (e.g. stud circles inside a brick outline).
-        // Sort largest-first so we keep piece outlines and drop internal details.
+        // Step 5: Non-maximum suppression — remove contours whose bbox is mostly
+        // inside a larger contour's bbox (stud circles inside a brick outline).
         candidates.sort {
             let a = $0.boundingBox; let b = $1.boundingBox
             return (a.width * a.height) > (b.width * b.height)
@@ -94,18 +125,17 @@ enum ReferenceProcessor {
                 guard !intersection.isNull, intersection.width > 0, intersection.height > 0 else {
                     return false
                 }
-                let overlapArea = intersection.width * intersection.height
-                return overlapArea / cArea > 0.5
+                return (intersection.width * intersection.height) / cArea > 0.5
             }
             if !dominated {
                 kept.append(candidate)
             }
         }
 
-        // Process surviving contours into descriptors
+        // Step 6: Process surviving contours into descriptors
         var descriptors: [ReferenceDescriptor] = []
         for contour in kept {
-            if let descriptor = try? processSingleContour(contour, in: cgImage) {
+            if let descriptor = try? processSingleContour(contour, in: pieceImage) {
                 descriptors.append(descriptor)
             }
         }
