@@ -27,6 +27,12 @@ struct ARViewContainer: UIViewRepresentable {
         context.coordinator.references = references
     }
 
+    static func dismantleUIView(_ uiView: ARView, coordinator: Coordinator) {
+        coordinator.invalidate()
+        uiView.session.pause()
+        uiView.session.delegate = nil
+    }
+
     func makeCoordinator() -> Coordinator {
         Coordinator(
             references: references,
@@ -49,6 +55,9 @@ struct ARViewContainer: UIViewRepresentable {
         /// Uses UnsafeSendableBox so it can be captured safely across isolation.
         private let taskInFlight = UnsafeSendableBox(false)
 
+        /// Set to true when the view is being torn down; prevents new Tasks.
+        private let invalidated = UnsafeSendableBox(false)
+
         init(
             references: [ReferenceDescriptor],
             overlayManager: HighlightOverlayManager,
@@ -61,8 +70,14 @@ struct ARViewContainer: UIViewRepresentable {
             self.throttler = throttler
         }
 
+        func invalidate() {
+            invalidated.value = true
+        }
+
         func session(_ session: ARSession, didUpdate frame: ARFrame) {
-            guard throttler.shouldProcess(), !taskInFlight.value else { return }
+            guard !invalidated.value,
+                  throttler.shouldProcess(),
+                  !taskInFlight.value else { return }
 
             let pixelBuffer = frame.capturedImage
             let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
@@ -75,6 +90,7 @@ struct ARViewContainer: UIViewRepresentable {
             let pipeline = pipeline
             let overlayManager = overlayManager
             let inFlightFlag = taskInFlight
+            let invalidFlag = invalidated
 
             inFlightFlag.value = true
 
@@ -86,6 +102,7 @@ struct ARViewContainer: UIViewRepresentable {
 
                 await MainActor.run {
                     inFlightFlag.value = false
+                    guard !invalidFlag.value else { return }
                     if let candidates {
                         overlayManager.update(candidates: candidates)
                     }

@@ -40,9 +40,13 @@ enum ReferenceProcessor {
     /// etc.) but is consistent within a single manual. Detection uses structural
     /// properties (uniform edges, contrasting center) rather than specific colors.
     static func processAll(image: UIImage) throws -> [ReferenceDescriptor] {
-        guard let cgImage = image.cgImage else {
+        guard let rawCGImage = image.cgImage else {
             throw ProcessingError.croppingFailed
         }
+
+        // Downsample to limit memory — 2000px is plenty for manual page analysis.
+        // Full iPad photos can be 12MP+ which causes OOM during feature extraction.
+        let cgImage = ContourDetector.downsample(rawCGImage, maxDimension: 2000)
 
         // Step 1: Detect contours on the full page
         let pageContours = try ContourDetector.detect(
@@ -282,6 +286,11 @@ enum ReferenceProcessor {
         let bbox = contour.boundingBox
 
         guard let croppedCGImage = cgImage.cropping(toNormalizedRect: bbox) else {
+            throw ProcessingError.croppingFailed
+        }
+
+        // Vision feature print extraction crashes on very small images
+        guard croppedCGImage.width >= 20, croppedCGImage.height >= 20 else {
             throw ProcessingError.croppingFailed
         }
 
