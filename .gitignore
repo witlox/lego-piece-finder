@@ -28,6 +28,10 @@ Package.resolved
 # CocoaPods
 Pods/
 
+# Images
+*.jpg
+*.jpeg
+
 # Misc
 .DS_Store
 *.swp
