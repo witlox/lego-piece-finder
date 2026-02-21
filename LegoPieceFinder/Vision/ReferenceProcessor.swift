@@ -28,65 +28,51 @@ enum ReferenceProcessor {
 
     // MARK: - Public API
 
-    /// Processes a photo of a LEGO manual callout box and extracts descriptors
-    /// for all piece illustrations found.
+    /// Processes a photo of a LEGO manual callout box or full page and
+    /// extracts descriptors for all piece illustrations found.
     ///
     /// Uses two strategies:
-    /// 1. **Text-guided** (preferred): Finds "1x", "2x" quantity markers via
-    ///    text recognition, divides the image into columns around each marker,
-    ///    and extracts the piece from each column. This reliably splits pieces
-    ///    that contour detection alone might merge.
+    /// 1. **Box-guided** (preferred): Finds "Nx" quantity markers via text
+    ///    recognition, groups them into callout boxes by proximity, crops the
+    ///    image per box, and extracts pieces from each box independently.
+    ///    This excludes subassemblies, illustrations, and 1:1 references.
     /// 2. **Contour-only** (fallback): If no quantity markers are found,
-    ///    detects contours directly and filters by size and color.
+    ///    detects contours directly and filters by size, color, and chroma.
     static func processAll(image: UIImage) throws -> [ReferenceDescriptor] {
-        // Normalize orientation first — UIImage.cgImage returns raw pixels
-        // without applying imageOrientation, so a rotated iPad would produce
-        // a sideways image breaking text recognition and column splitting.
         let normalized = image.normalizedOrientation()
         guard let rawCGImage = normalized.cgImage else {
             throw ProcessingError.croppingFailed
         }
 
-        // Downsample to limit memory — 2000px is plenty for callout box analysis.
         let cgImage = ContourDetector.downsample(rawCGImage, maxDimension: 2000)
         print("[RefProc] image \(cgImage.width)×\(cgImage.height)")
 
-        // Single text recognition pass — extract both quantity markers
-        // and all text regions (for filtering out step numbers etc.).
         let (markers, textRegions) = recognizeText(in: cgImage)
         print("[RefProc] text regions: \(textRegions.count), quantity markers: \(markers.count)")
 
-        // Run contour-only detection — this is the reliable base that finds
-        // all pieces. It may merge adjacent pieces into one contour though.
-        let contourDescriptors: [ReferenceDescriptor]
-        do {
-            contourDescriptors = try extractPiecesFromContours(
-                in: cgImage, textRegions: textRegions
+        // Strategy 1 (preferred): box-guided extraction.
+        // Groups markers into callout boxes and extracts pieces from each
+        // box independently, excluding subassemblies and illustrations.
+        if !markers.isEmpty {
+            let descriptors = extractPiecesFromBoxes(
+                markers: markers, in: cgImage, textRegions: textRegions
             )
-        } catch {
-            contourDescriptors = []
-        }
-        print("[RefProc] contour-only found \(contourDescriptors.count) pieces")
-
-        if markers.count > contourDescriptors.count {
-            // Markers suggest more pieces than contours found — use
-            // text-guided extraction which can split merged contours.
-            let markerDescriptors = extractPiecesUsingMarkers(
-                markers, in: cgImage, textRegions: textRegions
-            )
-            print("[RefProc] text-guided found \(markerDescriptors.count) pieces")
-
-            if markerDescriptors.count > contourDescriptors.count {
-                print("[RefProc] using text-guided (\(markerDescriptors.count) > \(contourDescriptors.count))")
-                return markerDescriptors
+            print("[RefProc] box-guided found \(descriptors.count) pieces from \(markers.count) markers")
+            if !descriptors.isEmpty {
+                return descriptors
             }
+            print("[RefProc] box-guided produced no results, falling through")
         }
+
+        // Strategy 2 (fallback): contour-only detection.
+        let contourDescriptors = try extractPiecesFromContours(
+            in: cgImage, textRegions: textRegions
+        )
+        print("[RefProc] contour-only found \(contourDescriptors.count) pieces")
 
         guard !contourDescriptors.isEmpty else {
             throw ProcessingError.noContoursFound
         }
-
-        print("[RefProc] using contour-only (\(contourDescriptors.count) pieces)")
         return contourDescriptors
     }
 
@@ -152,6 +138,128 @@ enum ReferenceProcessor {
         }
         return false
     }
+
+    // MARK: - Callout box detection
+
+    /// Groups quantity markers into separate callout boxes by spatial proximity.
+    /// Markers within the same piece box are close together; markers in
+    /// different boxes are separated by illustration areas.
+    private static func groupMarkersIntoBoxes(_ markers: [CGRect]) -> [[CGRect]] {
+        let n = markers.count
+        guard n > 1 else { return [markers] }
+
+        // Union-find
+        var parent = Array(0..<n)
+        func find(_ x: Int) -> Int {
+            var i = x
+            while parent[i] != i {
+                parent[i] = parent[parent[i]]
+                i = parent[i]
+            }
+            return i
+        }
+        func union(_ a: Int, _ b: Int) {
+            let ra = find(a), rb = find(b)
+            if ra != rb { parent[ra] = rb }
+        }
+
+        // Connect markers that are close enough to be in the same box.
+        // Within a piece box, markers are typically within 25% of image
+        // dimensions of each other.
+        let xThreshold: CGFloat = 0.25
+        let yThreshold: CGFloat = 0.25
+        for i in 0..<n {
+            for j in (i + 1)..<n {
+                if abs(markers[i].midX - markers[j].midX) < xThreshold &&
+                   abs(markers[i].midY - markers[j].midY) < yThreshold {
+                    union(i, j)
+                }
+            }
+        }
+
+        var groups: [Int: [CGRect]] = [:]
+        for i in 0..<n {
+            groups[find(i), default: []].append(markers[i])
+        }
+        return Array(groups.values)
+    }
+
+    /// Computes the bounding region for a group of markers, expanded to
+    /// include the piece area above the markers.
+    private static func boxRegion(for markers: [CGRect]) -> CGRect {
+        let minX = markers.map(\.minX).min()!
+        let maxX = markers.map(\.maxX).max()!
+        let minY = markers.map(\.minY).min()!
+        let maxY = markers.map(\.maxY).max()!
+
+        // Pieces are above markers (higher Y in Vision coordinates).
+        // Extend generously upward and slightly outward.
+        let left = max(0, minX - 0.08)
+        let bottom = max(0, minY - 0.03)
+        let right = min(1.0, maxX + 0.16)
+        let top = min(1.0, maxY + 0.50)
+
+        return CGRect(x: left, y: bottom, width: right - left, height: top - bottom)
+    }
+
+    /// Extracts pieces by grouping markers into callout boxes and processing
+    /// each box independently. This restricts extraction to regions that
+    /// contain quantity markers, excluding subassemblies and illustrations.
+    private static func extractPiecesFromBoxes(
+        markers: [CGRect],
+        in cgImage: CGImage,
+        textRegions: [CGRect]
+    ) -> [ReferenceDescriptor] {
+        let groups = groupMarkersIntoBoxes(markers)
+        print("[RefProc] \(groups.count) callout box(es) detected")
+
+        var allDescriptors: [ReferenceDescriptor] = []
+
+        for (bi, group) in groups.enumerated() {
+            let region = boxRegion(for: group)
+            print("[RefProc] box[\(bi)] \(group.count) markers, region=\(region)")
+
+            guard let crop = cgImage.cropping(toNormalizedRect: region) else {
+                print("[RefProc] box[\(bi)] crop failed")
+                continue
+            }
+            print("[RefProc] box[\(bi)] crop: \(crop.width)×\(crop.height)")
+
+            // Transform marker coordinates from image space to crop space
+            let transformedMarkers = group.map { marker in
+                CGRect(
+                    x: (marker.origin.x - region.origin.x) / region.width,
+                    y: (marker.origin.y - region.origin.y) / region.height,
+                    width: marker.width / region.width,
+                    height: marker.height / region.height
+                )
+            }
+
+            // Transform text regions that fall within the box
+            let transformedText = textRegions.compactMap { text -> CGRect? in
+                let t = CGRect(
+                    x: (text.origin.x - region.origin.x) / region.width,
+                    y: (text.origin.y - region.origin.y) / region.height,
+                    width: text.width / region.width,
+                    height: text.height / region.height
+                )
+                guard t.maxX > 0, t.maxY > 0, t.minX < 1, t.minY < 1 else {
+                    return nil
+                }
+                return t
+            }
+
+            let descriptors = extractPiecesUsingMarkers(
+                transformedMarkers, in: crop, textRegions: transformedText
+            )
+            print("[RefProc] box[\(bi)] found \(descriptors.count) pieces")
+            allDescriptors.append(contentsOf: descriptors)
+        }
+
+        return allDescriptors
+    }
+
+    // MARK: - Marker-guided extraction
 
     /// Extracts one piece per quantity marker using grid-based splitting.
     ///
@@ -246,7 +354,11 @@ enum ReferenceProcessor {
                     continue
                 }
 
-                var foundPiece = false
+                // Find the best piece contour: prefer interior, moderately-sized, dark.
+                // Contours are sorted largest-first; avoid selecting the box border.
+                var bestContour: VNContour?
+                var fallbackContour: VNContour?
+
                 for contour in contours {
                     let bbox = contour.boundingBox
                     let area = bbox.width * bbox.height
@@ -259,14 +371,31 @@ enum ReferenceProcessor {
                             inNormalizedRect: centerRect
                         ) {
                             if color.lab.L >= 85 { continue }
-                            print("[RefProc] piece[\(pieceIdx)] area=\(area) L=\(color.lab.L) — ok")
+                            print("[RefProc] piece[\(pieceIdx)] area=\(area) L=\(color.lab.L)")
                         }
                     }
 
+                    // Save first valid contour as fallback
+                    if fallbackContour == nil {
+                        fallbackContour = contour
+                    }
+
+                    // Prefer contours that don't span the whole cell
+                    // (box borders tend to be very large and touch cell edges)
+                    let touchesEdge = bbox.minX < 0.02 || bbox.minY < 0.02 ||
+                                      bbox.maxX > 0.98 || bbox.maxY > 0.98
+                    if area < 0.80 && !touchesEdge {
+                        bestContour = contour
+                        break
+                    }
+                }
+
+                var foundPiece = false
+                if let contour = bestContour ?? fallbackContour {
+                    print("[RefProc] piece[\(pieceIdx)] selected \(bestContour != nil ? "preferred" : "fallback") contour")
                     if let descriptor = try? processSingleContour(contour, in: regionCrop) {
                         descriptors.append(descriptor)
                         foundPiece = true
-                        break
                     }
                 }
                 if !foundPiece {
@@ -322,6 +451,11 @@ enum ReferenceProcessor {
                 ) {
                     if color.lab.L >= 82 {
                         print("[RefProc-C] contour[\(ci)] L=\(color.lab.L) >= 82, skip")
+                        continue
+                    }
+                    // Reject orange/yellow subassembly callouts
+                    if color.lab.a > 15 && color.lab.b > 30 {
+                        print("[RefProc-C] contour[\(ci)] warm chroma a*=\(color.lab.a) b*=\(color.lab.b), skip")
                         continue
                     }
                     print("[RefProc-C] contour[\(ci)] area=\(area) L=\(color.lab.L) — kept")
@@ -384,14 +518,31 @@ enum ReferenceProcessor {
         // Compactness (rotation-invariant, replaces aspect ratio)
         let compactness = ShapeDescriptor.compactness(of: contour)
 
-        // Feature prints from 4 rotations of the cropped image
+        // Create contour-masked versions of the crop:
+        // - Transparent bg: for color extraction (averageOpaqueColor needs alpha)
+        // - White bg: for feature print extraction (Vision dislikes alpha)
+        // - Off-white bg: for preview image (clean piece on neutral background)
+        let transparentMask = croppedCGImage.maskedWithContour(contour, bbox: bbox)
+        let whiteBg = CGColor(red: 1, green: 1, blue: 1, alpha: 1)
+        let whiteMask = croppedCGImage.maskedWithContour(contour, bbox: bbox, backgroundColor: whiteBg)
+        let offWhiteBg = CGColor(red: 0.94, green: 0.94, blue: 0.93, alpha: 1)
+        let previewMask = croppedCGImage.maskedWithContour(contour, bbox: bbox, backgroundColor: offWhiteBg)
+
+        if previewMask != nil {
+            print("[RefProc] contour mask created (\(croppedCGImage.width)×\(croppedCGImage.height))")
+        } else {
+            print("[RefProc] contour mask failed, using raw crop")
+        }
+
+        // Feature prints from 4 rotations — prefer white-bg masked image
+        let fpSource = whiteMask ?? croppedCGImage
         var featurePrints: [VNFeaturePrintObservation] = []
         for angle in rotationAngles {
             let rotatedImage: CGImage
             if angle == 0 {
-                rotatedImage = croppedCGImage
+                rotatedImage = fpSource
             } else {
-                guard let rotated = croppedCGImage.rotated(by: angle) else { continue }
+                guard let rotated = fpSource.rotated(by: angle) else { continue }
                 rotatedImage = rotated
             }
             if let fp = try? FeaturePrintExtractor.extract(from: rotatedImage) {
@@ -403,21 +554,27 @@ enum ReferenceProcessor {
             throw ProcessingError.featurePrintFailed
         }
 
-        // Dominant color — sample from center 60% of the crop to exclude the
-        // background that surrounds each piece in the callout box.
-        let centerRect = CGRect(x: 0.2, y: 0.2, width: 0.6, height: 0.6)
+        // Dominant color — prefer averaging opaque pixels from masked image,
+        // fall back to center-60% heuristic on the raw crop.
         let (lab, uiColor): (CIELABColor, UIColor)
-        if let centerColor = ColorAnalyzer.dominantColor(
-            of: croppedCGImage,
-            inNormalizedRect: centerRect
-        ) {
-            (lab, uiColor) = centerColor
+        if let masked = transparentMask,
+           let opaqueColor = ColorAnalyzer.averageOpaqueColor(of: masked) {
+            (lab, uiColor) = opaqueColor
         } else {
-            (lab, uiColor) = ColorAnalyzer.dominantColor(of: croppedCGImage)
+            let centerRect = CGRect(x: 0.2, y: 0.2, width: 0.6, height: 0.6)
+            if let centerColor = ColorAnalyzer.dominantColor(
+                of: croppedCGImage,
+                inNormalizedRect: centerRect
+            ) {
+                (lab, uiColor) = centerColor
+            } else {
+                (lab, uiColor) = ColorAnalyzer.dominantColor(of: croppedCGImage)
+            }
         }
 
-        // Reference image for preview
-        let referenceImage = UIImage(cgImage: croppedCGImage)
+        // Reference image for preview — piece on off-white background
+        let previewSource = previewMask ?? croppedCGImage
+        let referenceImage = UIImage(cgImage: previewSource)
 
         return ReferenceDescriptor(
             id: UUID(),
